@@ -16,8 +16,8 @@
         "label": "pill",
         "title": "Fuk",
         "url": "pill.html",
-        "width": 216,
-        "height": 56,
+        "width": 36,
+        "height": 36,
         "resizable": false,
         "decorations": false,
         "transparent": true,
@@ -30,7 +30,7 @@
         "minimizable": false,
         "maximizable": false,
         "closable": false,
-        "acceptFirstMouse": false
+        "acceptFirstMouse": true
       },
       {
         "label": "settings",

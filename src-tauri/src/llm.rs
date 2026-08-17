@@ -44,10 +44,7 @@ impl LlmEngine {
             return Ok(String::new());
         }
         let prompt = build_prompt(self.kind, transcript);
-        let add_bos = match self.kind {
-            LlmModelId::Llama32_1b => AddBos::Always,
-            LlmModelId::Qwen25_15b => AddBos::Never,
-        };
+        let add_bos = AddBos::Never;
         let tokens = self
             .model
             .str_to_token(&prompt, add_bos)
@@ -124,21 +121,42 @@ fn load_from_path(kind: LlmModelId, path: &Path) -> Result<LlmEngine> {
 
 fn build_prompt(kind: LlmModelId, user: &str) -> String {
     match kind {
-        LlmModelId::Llama32_1b => format!(
-            "<|start_header_id|>system<|end_header_id|>\n\n{SYSTEM_PROMPT}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{user}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
-        ),
-        LlmModelId::Qwen25_15b => format!(
+        LlmModelId::SmolLm2_360m => format!(
             "<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n"
+        ),
+        // Empty think block + /no_think turns off Qwen3 reasoning so polish
+        // returns cleaned text instead of a chain-of-thought.
+        LlmModelId::Qwen3_06b => format!(
+            "<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n<|im_start|>user\n{user} /no_think<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
         ),
     }
 }
 
 fn sanitize_output(raw: &str) -> String {
-    let mut s = raw.replace("<|eot_id|>", "");
+    let mut s = strip_think_blocks(raw);
+    s = s.replace("<|eot_id|>", "");
     s = s.replace("<|im_end|>", "");
+    s = s.replace("<|im_start|>", "");
     s = s.replace("<|end_of_text|>", "");
+    s = s.replace("/no_think", "");
     let s = s.trim();
     strip_wrapping_quotes(s).trim().to_string()
+}
+
+fn strip_think_blocks(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(start) = rest.find("<think>") {
+        out.push_str(&rest[..start]);
+        let after_open = start + "<think>".len();
+        if let Some(end_rel) = rest[after_open..].find("</think>") {
+            rest = &rest[after_open + end_rel + "</think>".len()..];
+        } else {
+            return out;
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 fn strip_wrapping_quotes(s: &str) -> &str {
@@ -156,5 +174,60 @@ fn strip_wrapping_quotes(s: &str) -> &str {
         &t[first.len_utf8()..t.len() - last.len_utf8()]
     } else {
         t
+    }
+}
+
+/// Tiny polish models sometimes replace the transcript with an unrelated word
+/// ("besting", "okay", …). Keep polish only when it still looks like the same
+/// utterance.
+pub fn is_faithful(raw: &str, polished: &str) -> bool {
+    let polished = polished.trim();
+    if polished.is_empty() {
+        return false;
+    }
+    let raw_words = significant_words(raw);
+    let pol_words = significant_words(polished);
+    if raw_words.is_empty() {
+        return true;
+    }
+    if pol_words.len() > raw_words.len().saturating_mul(3).saturating_add(4) {
+        return false;
+    }
+    let hits = raw_words
+        .iter()
+        .filter(|w| pol_words.iter().any(|p| words_match(w, p)))
+        .count();
+    if raw_words.len() <= 2 {
+        hits >= 1
+    } else {
+        hits * 2 >= raw_words.len()
+    }
+}
+
+fn significant_words(s: &str) -> Vec<String> {
+    s.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() >= 2)
+        .map(|w| w.to_lowercase())
+        .collect()
+}
+
+fn words_match(a: &str, b: &str) -> bool {
+    a == b || a.starts_with(b) || b.starts_with(a)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strips_qwen3_think_block() {
+        let raw = "<think>\nreasoning\n</think>\n\nHello, world.";
+        assert_eq!(sanitize_output(raw), "Hello, world.");
+    }
+
+    #[test]
+    fn rejects_unrelated_polish() {
+        assert!(!is_faithful("testing the insert path", "besting"));
+        assert!(is_faithful("hello there um", "Hello there."));
     }
 }

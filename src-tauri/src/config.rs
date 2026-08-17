@@ -32,10 +32,12 @@ pub enum WhisperModelId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LlmModelId {
-    #[serde(rename = "llama-3.2-1b")]
-    Llama32_1b,
-    #[serde(rename = "qwen2.5-1.5b")]
-    Qwen25_15b,
+    /// ChatML SmolLM2 360M Instruct Q4_K_M. Used on lower-spec machines.
+    #[serde(rename = "smollm2-360m", alias = "llama-3.2-1b")]
+    SmolLm2_360m,
+    /// ChatML Qwen3 0.6B Q4_K_M. Used on higher-spec machines.
+    #[serde(rename = "qwen3-0.6b", alias = "qwen2.5-1.5b")]
+    Qwen3_06b,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,7 +48,7 @@ pub enum InsertMode {
 }
 
 /// Bumped when stored settings need a one-time rewrite. See [`migrate`].
-const SETTINGS_VERSION: u32 = 2;
+const SETTINGS_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -58,6 +60,8 @@ pub struct AppConfig {
     pub input_device: Option<String>,
     pub insert_mode: InsertMode,
     pub first_run_complete: bool,
+    pub overlay_x: Option<i32>,
+    pub overlay_y: Option<i32>,
     /// Absent in files written before migrations existed, and those are exactly
     /// the ones that need migrating — so this must not inherit the container
     /// default, which is the current version.
@@ -73,12 +77,14 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             hotkey: default_hotkey(),
-            mode: AppMode::Fast,
+            mode: AppMode::Polish,
             whisper_model: WhisperModelId::BaseEn,
-            llm_model: LlmModelId::Llama32_1b,
+            llm_model: recommended_llm(),
             input_device: None,
             insert_mode: default_insert_mode(),
             first_run_complete: false,
+            overlay_x: None,
+            overlay_y: None,
             settings_version: SETTINGS_VERSION,
         }
     }
@@ -113,15 +119,15 @@ impl WhisperModelId {
 impl LlmModelId {
     pub fn as_id(self) -> &'static str {
         match self {
-            Self::Llama32_1b => "llama-3.2-1b",
-            Self::Qwen25_15b => "qwen2.5-1.5b",
+            Self::SmolLm2_360m => "smollm2-360m",
+            Self::Qwen3_06b => "qwen3-0.6b",
         }
     }
 
     pub fn filename(self) -> &'static str {
         match self {
-            Self::Llama32_1b => "Llama-3.2-1B-Instruct-Q4_K_M.gguf",
-            Self::Qwen25_15b => "qwen2.5-1.5b-instruct-q4_k_m.gguf",
+            Self::SmolLm2_360m => "SmolLM2-360M-Instruct-Q4_K_M.gguf",
+            Self::Qwen3_06b => "Qwen_Qwen3-0.6B-Q4_K_M.gguf",
         }
     }
 
@@ -130,8 +136,30 @@ impl LlmModelId {
     }
 
     pub fn all() -> [Self; 2] {
-        [Self::Llama32_1b, Self::Qwen25_15b]
+        [Self::SmolLm2_360m, Self::Qwen3_06b]
     }
+}
+
+pub fn recommended_llm() -> LlmModelId {
+    match crate::hardware::machine_tier() {
+        crate::hardware::MachineTier::Lower => LlmModelId::SmolLm2_360m,
+        crate::hardware::MachineTier::Higher => LlmModelId::Qwen3_06b,
+    }
+}
+
+/// Re-pick the polish model from current hardware. Returns whether it changed.
+pub fn apply_hardware_llm(cfg: &mut AppConfig) -> bool {
+    let next = recommended_llm();
+    if cfg.llm_model == next {
+        return false;
+    }
+    log::info!(
+        "auto-select polish model {} ({})",
+        next.as_id(),
+        crate::hardware::machine_tier().as_id()
+    );
+    cfg.llm_model = next;
+    true
 }
 
 pub fn config_dir() -> PathBuf {
@@ -170,7 +198,9 @@ pub fn load() -> AppConfig {
     match fs::read_to_string(&path) {
         Ok(raw) => match toml::from_str::<AppConfig>(&raw) {
             Ok(mut cfg) => {
-                if migrate(&mut cfg) {
+                let migrated = migrate(&mut cfg);
+                let picked = apply_hardware_llm(&mut cfg);
+                if migrated || picked {
                     if let Err(e) = save(&cfg) {
                         log::warn!("failed to write migrated config: {e}");
                     }
@@ -225,6 +255,19 @@ fn migrate(cfg: &mut AppConfig) -> bool {
     // dictation look broken, because nothing is ever inserted.
     if cfg.insert_mode == InsertMode::ClipboardOnly && !is_wayland() {
         cfg.insert_mode = InsertMode::Paste;
+    }
+
+    // v3: Llama 3.2 / Qwen2.5 polish models are gone. Hardware pick happens
+    // in apply_hardware_llm on every load, including this migration.
+    if cfg.settings_version < 3 && cfg.mode == AppMode::Fast {
+        cfg.mode = AppMode::Polish;
+    }
+
+    // v4: the idle ball moved to bottom-center; drop positions saved under the
+    // old bottom-right default so everyone starts at the new spot.
+    if cfg.settings_version < 4 {
+        cfg.overlay_x = None;
+        cfg.overlay_y = None;
     }
 
     cfg.settings_version = SETTINGS_VERSION;
@@ -298,10 +341,16 @@ mod tests {
             r#"
             hotkey = "ControlRight"
             insert_mode = "paste"
-            settings_version = 2
+            settings_version = 4
             "#,
         );
         assert!(!migrate(&mut cfg));
         assert_eq!(cfg.insert_mode, InsertMode::Paste);
+    }
+
+    #[test]
+    fn old_llama_id_maps_to_smollm() {
+        let cfg: AppConfig = toml::from_str(r#"llm_model = "llama-3.2-1b""#).unwrap();
+        assert_eq!(cfg.llm_model, LlmModelId::SmolLm2_360m);
     }
 }

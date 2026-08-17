@@ -9,6 +9,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 
 use crate::config::{self, AppConfig, LlmModelId, WhisperModelId};
+use crate::hardware;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelFileStatus {
@@ -25,6 +26,7 @@ pub struct ModelStatus {
     pub llm: Vec<ModelFileStatus>,
     pub ready_for_fast: bool,
     pub ready_for_polish: bool,
+    pub machine_tier: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -50,6 +52,7 @@ pub fn get_model_status(config: &AppConfig) -> ModelStatus {
         llm,
         ready_for_fast,
         ready_for_polish,
+        machine_tier: hardware::machine_tier().as_id().to_string(),
     }
 }
 
@@ -65,15 +68,6 @@ fn file_status(id: &str, filename: &str, required: bool) -> ModelFileStatus {
         present,
         size_bytes,
         required,
-    }
-}
-
-pub fn models_ready(config: &AppConfig) -> bool {
-    match config.mode {
-        config::AppMode::Fast => config.whisper_model.path().is_file(),
-        config::AppMode::Polish => {
-            config.whisper_model.path().is_file() && config.llm_model.path().is_file()
-        }
     }
 }
 
@@ -100,36 +94,34 @@ fn spec_whisper(id: WhisperModelId) -> DownloadSpec {
 
 fn spec_llm(id: LlmModelId) -> DownloadSpec {
     match id {
-        LlmModelId::Llama32_1b => DownloadSpec {
+        LlmModelId::SmolLm2_360m => DownloadSpec {
             id: id.as_id().to_string(),
             filename: id.filename().to_string(),
-            url: "https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf"
+            url: "https://huggingface.co/bartowski/SmolLM2-360M-Instruct-GGUF/resolve/main/SmolLM2-360M-Instruct-Q4_K_M.gguf"
                 .to_string(),
         },
-        LlmModelId::Qwen25_15b => DownloadSpec {
+        LlmModelId::Qwen3_06b => DownloadSpec {
             id: id.as_id().to_string(),
             filename: id.filename().to_string(),
-            url: "https://huggingface.co/bartowski/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-1.5B-Instruct-Q4_K_M.gguf"
+            url: "https://huggingface.co/bartowski/Qwen_Qwen3-0.6B-GGUF/resolve/main/Qwen_Qwen3-0.6B-Q4_K_M.gguf"
                 .to_string(),
         },
     }
 }
 
 fn needed_downloads(config: &AppConfig) -> Vec<DownloadSpec> {
-    let mut specs = vec![
-        spec_whisper(WhisperModelId::BaseEn),
-        spec_llm(LlmModelId::Llama32_1b),
+    let specs = vec![
+        spec_whisper(config.whisper_model),
+        spec_llm(config.llm_model),
     ];
-    if config.whisper_model != WhisperModelId::BaseEn {
-        specs.push(spec_whisper(config.whisper_model));
-    }
-    if config.llm_model != LlmModelId::Llama32_1b {
-        specs.push(spec_llm(config.llm_model));
-    }
     specs
         .into_iter()
         .filter(|s| !config::models_dir().join(&s.filename).is_file())
         .collect()
+}
+
+pub fn pending_downloads(config: &AppConfig) -> bool {
+    !needed_downloads(config).is_empty()
 }
 
 pub async fn start_model_download(app: &AppHandle, config: &AppConfig) -> Result<()> {

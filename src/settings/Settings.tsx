@@ -148,6 +148,7 @@ export function Settings() {
   const [justBound, setJustBound] = useState(false);
   const captureRef = useRef<HTMLDivElement | null>(null);
   const boundTimer = useRef<number | null>(null);
+  const autoDownload = useRef(false);
 
   const flashBound = useCallback(() => {
     if (boundTimer.current !== null) window.clearTimeout(boundTimer.current);
@@ -186,6 +187,20 @@ export function Settings() {
       setBanner(errorMessage(err));
     }
   }, []);
+
+  const startDownload = useCallback(async () => {
+    try {
+      setBanner(null);
+      setDownloading(true);
+      await api.startModelDownload();
+      await refreshModels();
+      setDownloading(false);
+      setProgress(null);
+    } catch (err) {
+      setDownloading(false);
+      setBanner(errorMessage(err));
+    }
+  }, [refreshModels]);
 
   useEffect(() => {
     let alive = true;
@@ -227,6 +242,14 @@ export function Settings() {
       alive = false;
     };
   }, []);
+
+  useEffect(() => {
+    if (!status) return;
+    if (status.ready_for_fast && status.ready_for_polish) return;
+    if (downloading || autoDownload.current) return;
+    autoDownload.current = true;
+    void startDownload();
+  }, [downloading, startDownload, status]);
 
   useEffect(() => {
     const onFocus = () => {
@@ -300,20 +323,6 @@ export function Settings() {
   const patch = (partial: Partial<AppConfig>) => {
     if (!config) return;
     void persist({ ...config, ...partial });
-  };
-
-  const startDownload = async () => {
-    try {
-      setBanner(null);
-      setDownloading(true);
-      await api.startModelDownload();
-      await refreshModels();
-      setDownloading(false);
-      setProgress(null);
-    } catch (err) {
-      setDownloading(false);
-      setBanner(errorMessage(err));
-    }
   };
 
   const enableMic = async () => {
@@ -414,8 +423,15 @@ export function Settings() {
   const polishReady = status?.ready_for_polish ?? false;
   const modelsReady = fastReady && polishReady;
   const llmEnabled = config?.mode === "polish";
+  const polishModel =
+    LLM_MODELS.find(
+      (model) =>
+        model.id === (config?.llm_model ?? DEFAULT_CONFIG.llm_model),
+    ) ?? LLM_MODELS[0];
   const missing = status
-    ? [...status.whisper, ...status.llm].filter((file) => !file.present)
+    ? [...status.whisper, ...status.llm].filter(
+        (file) => file.required && !file.present,
+      )
     : [];
 
   const readiness: { label: string; tone: Tone } = (() => {
@@ -429,8 +445,7 @@ export function Settings() {
     const blocked =
       !fastReady ||
       !micOk ||
-      (hotkeyNeedsAccessibility && !accessibilityOk) ||
-      (config?.mode === "polish" && !polishReady);
+      (hotkeyNeedsAccessibility && !accessibilityOk);
     return blocked
       ? { label: "Needs setup", tone: "warn" }
       : { label: "Ready", tone: "ok" };
@@ -476,12 +491,12 @@ export function Settings() {
           <div className="mb-8 border border-ink bg-card p-6 shadow-press-lg">
             <Eyebrow>First run</Eyebrow>
             <h2 className="mt-3 font-display text-[20px] font-semibold tracking-[-0.01em] text-ink">
-              {fastReady ? "Finish setup" : "Download models"}
+              {downloading ? "Downloading models" : "Preparing models"}
             </h2>
             <p className="mt-2 font-sans text-[15px] leading-[1.65]">
-              {fastReady
-                ? "Speech models are in place. Add the local LLM to unlock Polish mode."
-                : "Fuk fetches Whisper and the LLM once from Hugging Face, then runs fully offline."}
+              Fuk picks a polish model for this Mac and fetches Whisper plus the
+              LLM from Hugging Face in the background. After that it runs fully
+              offline.
             </p>
             {missing.length > 0 ? (
               <ul className="mt-3 flex flex-wrap gap-1.5">
@@ -495,18 +510,18 @@ export function Settings() {
                 ))}
               </ul>
             ) : null}
-            <Btn
-              variant="accent"
-              className="mt-5"
-              disabled={downloading}
-              onClick={() => void startDownload()}
-            >
-              {downloading
-                ? "Downloading"
-                : fastReady
-                  ? "Download LLM"
-                  : "Download models"}
-            </Btn>
+            {banner && !downloading ? (
+              <Btn
+                variant="accent"
+                className="mt-5"
+                onClick={() => {
+                  autoDownload.current = false;
+                  void startDownload();
+                }}
+              >
+                Retry download
+              </Btn>
+            ) : null}
             {progress ? (
               <div className="mt-5">
                 <div className="mb-1.5 flex items-baseline justify-between gap-3 font-mono text-[11px] uppercase tracking-[0.12em]">
@@ -516,6 +531,10 @@ export function Settings() {
                   </span>
                 </div>
                 <ProgressBar percent={percent} />
+              </div>
+            ) : downloading ? (
+              <div className="mt-5">
+                <ProgressBar percent={null} />
               </div>
             ) : null}
           </div>
@@ -613,15 +632,17 @@ export function Settings() {
               value={config?.mode ?? DEFAULT_CONFIG.mode}
               options={[
                 { id: "fast", label: "Fast" },
-                { id: "polish", label: "Polish", disabled: !polishReady },
+                { id: "polish", label: "Polish" },
               ]}
               ariaLabel="Transcription mode"
               onChange={(mode) => patch({ mode })}
             />
-            <p className="mt-3 font-sans text-[13px] leading-relaxed text-mute">
+            <p className="mt-3 font-sans text-[13px] leading-[1.65] text-mute">
               Fast runs Whisper with rule-based cleanup. Polish adds a local LLM
               pass for punctuation and phrasing.
-              {!polishReady ? " Download the LLM to enable Polish." : ""}
+              {!polishReady
+                ? " The polish model downloads automatically in the background."
+                : ""}
             </p>
 
             <CardLabel>Speech model</CardLabel>
@@ -642,26 +663,22 @@ export function Settings() {
 
             <CardLabel>
               Polish model
-              {!llmEnabled ? (
-                <span className="ml-2 font-normal normal-case tracking-normal text-faint">
-                  Used in Polish mode
-                </span>
-              ) : null}
+              <span className="ml-2 font-normal normal-case tracking-normal text-faint">
+                Auto-selected
+              </span>
             </CardLabel>
-            <OptionGroup label="Polish model">
-              {LLM_MODELS.map((model) => (
-                <OptionRow
-                  key={model.id}
-                  selected={
-                    (config?.llm_model ?? DEFAULT_CONFIG.llm_model) === model.id
-                  }
-                  label={model.label}
-                  hint={model.hint}
-                  disabled={!llmEnabled}
-                  onSelect={() => patch({ llm_model: model.id })}
-                />
-              ))}
-            </OptionGroup>
+            <div className="border border-ink bg-paper-deep px-3 py-2.5">
+              <p className="font-display text-[16px] font-semibold tracking-[-0.01em] text-ink">
+                {polishModel.label}
+              </p>
+              <p className="mt-0.5 font-sans text-[13px] leading-relaxed text-mute">
+                {status?.machine_tier === "higher"
+                  ? "Higher-spec machine — Qwen3 0.6B Q4."
+                  : "Lower-spec machine — SmolLM2 360M Q4."}{" "}
+                {polishModel.hint}
+                {!llmEnabled ? " Used in Polish mode." : ""}
+              </p>
+            </div>
           </Section>
 
           <Section label="Audio & output">

@@ -4,7 +4,7 @@ use std::thread;
 use std::time::Duration;
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, Manager, PhysicalPosition};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::audio;
 use crate::cleanup;
@@ -85,18 +85,23 @@ pub fn on_hotkey_down(app: &AppHandle) {
     }
 
     let config = state.config.lock().clone();
-    if !download::models_ready(&config) {
-        emit_error(
-            app,
-            "Required models are missing. Open Settings to download them.",
-        );
-        tray::show_settings_on_main(app);
+    if download::whisper_missing(&config) {
+        if state.downloading.load(Ordering::SeqCst) {
+            emit_error(app, "Speech model is still downloading. Try again in a moment.");
+        } else {
+            emit_error(
+                app,
+                "Speech model is not ready yet. It downloads automatically in the background.",
+            );
+            crate::kickoff_model_download(app);
+        }
         return;
     }
 
     // Opening the input stream costs tens of milliseconds, and the pill is the
     // only signal that the key registered, so put it on screen first.
-    show_pill(app);
+    crate::focus::start_caret_watch();
+    crate::overlay::expand(app);
     let _ = app.emit("recording-started", ());
     emit_app_state(app, AppUiState::Recording);
 
@@ -106,7 +111,8 @@ pub fn on_hotkey_down(app: &AppHandle) {
     });
 
     if let Err(e) = state.capture.start(config.input_device.as_deref(), on_level) {
-        hide_pill(app);
+        crate::focus::stop_caret_watch();
+        crate::overlay::collapse(app);
         emit_app_state(app, AppUiState::Idle);
         emit_error(app, format!("Could not start microphone: {e}"));
         return;
@@ -135,11 +141,20 @@ pub fn on_hotkey_up(app: &AppHandle) {
         })
     {
         log::error!("failed to spawn pipeline thread: {e}");
+        crate::focus::stop_caret_watch();
         state.processing.store(false, Ordering::SeqCst);
     }
 }
 
 fn run_pipeline(app: &AppHandle) {
+    struct StopWatch;
+    impl Drop for StopWatch {
+        fn drop(&mut self) {
+            crate::focus::stop_caret_watch();
+        }
+    }
+    let _watch = StopWatch;
+
     let state = app.state::<AppState>();
     let config = state.config.lock().clone();
     let (samples, sample_rate) = state.capture.stop();
@@ -148,14 +163,14 @@ fn run_pipeline(app: &AppHandle) {
     let pcm = audio::trim_silence(&pcm);
     if pcm.len() < MIN_SAMPLES_16K {
         emit_error(app, "Didn't catch that");
-        hide_pill(app);
+        crate::overlay::collapse(app);
         emit_app_state(app, AppUiState::Idle);
         return;
     }
 
     let _ = app.emit("processing", ());
     emit_app_state(app, AppUiState::Processing);
-    show_pill(app);
+    crate::overlay::raise(app);
 
     let whisper_model = config.whisper_model;
     {
@@ -166,7 +181,7 @@ fn run_pipeline(app: &AppHandle) {
                 Ok(eng) => *slot = Some(eng),
                 Err(e) => {
                     emit_error(app, format!("Failed to load Whisper: {e}"));
-                    hide_pill(app);
+                    crate::overlay::collapse(app);
                     emit_app_state(app, AppUiState::Idle);
                     return;
                 }
@@ -181,14 +196,14 @@ fn run_pipeline(app: &AppHandle) {
                 Ok(t) => t,
                 Err(e) => {
                     emit_error(app, format!("Transcription failed: {e}"));
-                    hide_pill(app);
+                    crate::overlay::collapse(app);
                     emit_app_state(app, AppUiState::Idle);
                     return;
                 }
             },
             None => {
                 emit_error(app, "Whisper engine is not loaded");
-                hide_pill(app);
+                crate::overlay::collapse(app);
                 emit_app_state(app, AppUiState::Idle);
                 return;
             }
@@ -199,14 +214,14 @@ fn run_pipeline(app: &AppHandle) {
         AppMode::Fast => cleanup::cleanup_fast(&raw),
         AppMode::Polish => {
             let llm_kind = config.llm_model;
-            {
+            if llm_kind.path().is_file() {
                 let mut slot = state.llm.lock();
                 let reload = slot.as_ref().map(|e| e.kind != llm_kind).unwrap_or(true);
                 if reload {
                     match LlmEngine::load(llm_kind) {
                         Ok(eng) => *slot = Some(eng),
                         Err(e) => {
-                            emit_error(app, format!("Failed to load polish model: {e}"));
+                            log::warn!("Failed to load polish model: {e}");
                         }
                     }
                 }
@@ -216,14 +231,23 @@ fn run_pipeline(app: &AppHandle) {
                 slot.as_ref().and_then(|eng| match eng.polish(&raw) {
                     Ok(t) => Some(t),
                     Err(e) => {
-                        emit_error(app, format!("Polish failed, using fast cleanup: {e}"));
+                        log::warn!("Polish failed, using fast cleanup: {e}");
                         None
                     }
                 })
             };
-            polished.unwrap_or_else(|| cleanup::cleanup_fast(&raw))
+            match polished {
+                Some(p) if crate::llm::is_faithful(&raw, &p) => p,
+                Some(p) => {
+                    log::warn!("polish drifted ({p:?} from {raw:?}); using fast cleanup");
+                    cleanup::cleanup_fast(&raw)
+                }
+                None => cleanup::cleanup_fast(&raw),
+            }
         }
     };
+
+    log::info!("transcript raw={raw:?} final={text:?}");
 
     *state.last_text.lock() = text.clone();
     if let Err(e) = inject::insert_text(app, &text, config.insert_mode) {
@@ -232,52 +256,9 @@ fn run_pipeline(app: &AppHandle) {
 
     let _ = app.emit("done", DonePayload { text });
     emit_app_state(app, AppUiState::Idle);
-    // Long enough for the pill to flash its confirmation and play its exit.
-    let app_hide = app.clone();
+    let app_collapse = app.clone();
     thread::spawn(move || {
         thread::sleep(Duration::from_millis(420));
-        hide_pill(&app_hide);
-    });
-}
-
-pub fn show_pill(app: &AppHandle) {
-    let app = app.clone();
-    let app_main = app.clone();
-    let _ = app.run_on_main_thread(move || show_pill_inner(&app_main));
-}
-
-fn show_pill_inner(app: &AppHandle) {
-    let Some(win) = app.get_webview_window("pill") else {
-        return;
-    };
-    let monitor = win
-        .current_monitor()
-        .ok()
-        .flatten()
-        .or_else(|| win.primary_monitor().ok().flatten());
-    if let Some(monitor) = monitor {
-        let scale = monitor.scale_factor();
-        let mpos = monitor.position();
-        let msize = monitor.size();
-        let pill = win
-            .outer_size()
-            .unwrap_or(tauri::PhysicalSize::new(
-                (216.0 * scale) as u32,
-                (56.0 * scale) as u32,
-            ));
-        let x = mpos.x + (msize.width as i32 - pill.width as i32) / 2;
-        let y = mpos.y + msize.height as i32 - pill.height as i32 - (36.0 * scale) as i32;
-        let _ = win.set_position(PhysicalPosition::new(x, y));
-    }
-    crate::focus::show_overlay(&win);
-}
-
-pub fn hide_pill(app: &AppHandle) {
-    let app = app.clone();
-    let app_main = app.clone();
-    let _ = app.run_on_main_thread(move || {
-        if let Some(win) = app_main.get_webview_window("pill") {
-            let _ = win.hide();
-        }
+        crate::overlay::collapse(&app_collapse);
     });
 }

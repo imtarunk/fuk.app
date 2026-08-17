@@ -80,7 +80,7 @@ pub(crate) fn accessibility_trusted(prompt: bool) -> bool {
     let _ = prompt;
     #[cfg(target_os = "macos")]
     {
-        macos_accessibility_client::accessibility::application_is_trusted()
+        crate::ax::api_available()
     }
     #[cfg(not(target_os = "macos"))]
     {

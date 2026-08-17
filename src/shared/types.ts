@@ -1,7 +1,7 @@
 export type AppMode = "fast" | "polish";
 export type InsertMode = "paste" | "clipboard_only";
 export type WhisperModelId = "tiny.en" | "base.en" | "small.en";
-export type LlmModelId = "llama-3.2-1b" | "qwen2.5-1.5b";
+export type LlmModelId = "smollm2-360m" | "qwen3-0.6b";
 export type AppUiState = "idle" | "recording" | "processing" | "downloading";
 export type PermissionKind = "microphone" | "accessibility";
 
@@ -13,6 +13,8 @@ export interface AppConfig {
   input_device: string | null;
   insert_mode: InsertMode;
   first_run_complete: boolean;
+  overlay_x: number | null;
+  overlay_y: number | null;
   settings_version: number;
 }
 
@@ -35,6 +37,7 @@ export interface ModelStatus {
   llm: ModelFileStatus[];
   ready_for_fast: boolean;
   ready_for_polish: boolean;
+  machine_tier: "lower" | "higher";
 }
 
 export interface PermissionsStatus {
@@ -93,17 +96,19 @@ export const LLM_MODELS: {
   label: string;
   hint: string;
 }[] = [
-  { id: "llama-3.2-1b", label: "Llama 3.2 1B", hint: "~800 MB · default polish model" },
-  { id: "qwen2.5-1.5b", label: "Qwen2.5 1.5B", hint: "~1.1 GB · slightly stronger cleanup" },
+  { id: "smollm2-360m", label: "SmolLM2 360M Q4", hint: "~270 MB · lighter polish for this machine" },
+  { id: "qwen3-0.6b", label: "Qwen3 0.6B Q4", hint: "~480 MB · stronger polish for this machine" },
 ];
 
 export const DEFAULT_CONFIG: AppConfig = {
   hotkey: "Alt+Space",
-  mode: "fast",
+  mode: "polish",
   whisper_model: "base.en",
-  llm_model: "llama-3.2-1b",
+  llm_model: "smollm2-360m",
   input_device: null,
   insert_mode: "paste",
   first_run_complete: false,
-  settings_version: 1,
+  overlay_x: null,
+  overlay_y: null,
+  settings_version: 4,
 };

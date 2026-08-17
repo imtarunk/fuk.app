@@ -5,11 +5,13 @@ mod cleanup;
 mod config;
 mod download;
 mod focus;
+mod hardware;
 mod hotkey;
 #[cfg(target_os = "macos")]
 mod hotkey_macos;
 mod inject;
 mod llm;
+mod overlay;
 mod permissions;
 mod pipeline;
 mod stt;
@@ -61,8 +63,18 @@ fn get_config(state: tauri::State<AppState>) -> Result<AppConfig, String> {
 fn save_config(
     app: tauri::AppHandle,
     state: tauri::State<AppState>,
-    config: AppConfig,
+    mut config: AppConfig,
 ) -> Result<AppConfig, String> {
+    {
+        let prev = state.config.lock();
+        if config.overlay_x.is_none() {
+            config.overlay_x = prev.overlay_x;
+        }
+        if config.overlay_y.is_none() {
+            config.overlay_y = prev.overlay_y;
+        }
+    }
+    config::apply_hardware_llm(&mut config);
     config::save(&config).map_err(|e| e.to_string())?;
     let (whisper_changed, llm_changed) = {
         let slot = state.config.lock();
@@ -79,6 +91,9 @@ fn save_config(
     }
     *state.config.lock() = config.clone();
     let _ = app.emit("config-updated", config.clone());
+    if download::pending_downloads(&config) {
+        kickoff_model_download(&app);
+    }
     Ok(config)
 }
 
@@ -95,9 +110,26 @@ fn get_model_status(state: tauri::State<AppState>) -> Result<download::ModelStat
 
 #[tauri::command]
 async fn start_model_download(app: tauri::AppHandle) -> Result<(), String> {
+    run_model_download(app).await
+}
+
+pub(crate) fn kickoff_model_download(app: &tauri::AppHandle) {
+    let cfg = app.state::<AppState>().config.lock().clone();
+    if !download::pending_downloads(&cfg) {
+        return;
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = run_model_download(app).await {
+            log::warn!("background model download: {e}");
+        }
+    });
+}
+
+async fn run_model_download(app: tauri::AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
     if state.downloading.swap(true, Ordering::SeqCst) {
-        return Err("A download is already in progress".into());
+        return Ok(());
     }
     let config = state.config.lock().clone();
     drop(state);
@@ -120,6 +152,7 @@ async fn start_model_download(app: tauri::AppHandle) -> Result<(), String> {
             }
             pipeline::emit_app_state(&app, AppUiState::Idle);
             preload_whisper(&app);
+            preload_llm(&app);
             Ok(())
         }
         Err(e) => {
@@ -201,6 +234,36 @@ fn retry_last_insert(app: tauri::AppHandle, state: tauri::State<AppState>) -> Re
     Ok(())
 }
 
+fn preload_llm(app: &tauri::AppHandle) {
+    let app = app.clone();
+    std::thread::Builder::new()
+        .name("dictate-llm-preload".into())
+        .spawn(move || {
+            let state = app.state::<AppState>();
+            let kind = state.config.lock().llm_model;
+            if !kind.path().is_file() {
+                return;
+            }
+            let already = state
+                .llm
+                .lock()
+                .as_ref()
+                .map(|e| e.kind == kind)
+                .unwrap_or(false);
+            if already {
+                return;
+            }
+            match LlmEngine::load(kind) {
+                Ok(engine) => {
+                    *state.llm.lock() = Some(engine);
+                    log::info!("polish model {} loaded", kind.as_id());
+                }
+                Err(e) => log::warn!("polish preload failed: {e}"),
+            }
+        })
+        .ok();
+}
+
 fn preload_whisper(app: &tauri::AppHandle) {
     let app = app.clone();
     std::thread::Builder::new()
@@ -237,7 +300,10 @@ fn preload_whisper(app: &tauri::AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let _ = env_logger::try_init();
+    let _ = env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("dictate_lib=info,dictate=info"),
+    )
+    .try_init();
     let config = config::load();
 
     tauri::Builder::default()
@@ -271,15 +337,10 @@ pub fn run() {
 
             focus::init();
 
-            for label in ["pill", "settings"] {
-                if let Some(win) = app.get_webview_window(label) {
-                    let _ = win.hide();
-                }
+            if let Some(settings) = app.get_webview_window("settings") {
+                let _ = settings.hide();
             }
-            if let Some(pill) = app.get_webview_window("pill") {
-                let _ = pill.set_focusable(false);
-                let _ = pill.set_ignore_cursor_events(true);
-            }
+            overlay::show_idle(app.handle());
 
             if let Err(e) = tray::install(app.handle()) {
                 log::error!("tray setup failed: {e}");
@@ -288,21 +349,29 @@ pub fn run() {
             hotkey::start(app.handle());
 
             let cfg = app.state::<AppState>().config.lock().clone();
-            if !cfg.first_run_complete || download::whisper_missing(&cfg) {
+            if !cfg.first_run_complete {
                 tray::show_settings(app.handle());
             }
+            kickoff_model_download(app.handle());
             if !download::whisper_missing(&cfg) {
                 preload_whisper(app.handle());
+            }
+            if cfg.llm_model.path().is_file() {
+                preload_llm(app.handle());
             }
 
             Ok(())
         })
         .on_window_event(|window, event| {
-            if window.label() == "settings" {
-                if let WindowEvent::CloseRequested { api, .. } = event {
+            match event {
+                WindowEvent::CloseRequested { api, .. } if window.label() == "settings" => {
                     api.prevent_close();
                     let _ = window.hide();
                 }
+                WindowEvent::Moved(pos) if window.label() == "pill" => {
+                    overlay::on_moved(window.app_handle(), *pos);
+                }
+                _ => {}
             }
         })
         .run(tauri::generate_context!())

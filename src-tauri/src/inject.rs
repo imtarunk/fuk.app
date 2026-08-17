@@ -1,5 +1,4 @@
-use anyhow::{Context, Result};
-use arboard::Clipboard;
+use anyhow::Result;
 
 use crate::config::{is_wayland, InsertMode};
 
@@ -14,7 +13,7 @@ pub fn insert_text(app: &tauri::AppHandle, text: &str, mode: InsertMode) -> Resu
         return Ok(InsertResult::Copied);
     }
     if mode == InsertMode::ClipboardOnly || is_wayland() {
-        set_clipboard(text)?;
+        set_clipboard(app, text)?;
         return Ok(InsertResult::Copied);
     }
     paste_at_caret(app, text)
@@ -24,30 +23,80 @@ pub fn retry_insert(app: &tauri::AppHandle, text: &str, mode: InsertMode) -> Res
     insert_text(app, text, mode)
 }
 
-fn set_clipboard(text: &str) -> Result<()> {
-    let mut clipboard = Clipboard::new().context("open clipboard")?;
-    clipboard.set_text(text).context("set clipboard")?;
-    Ok(())
+fn set_clipboard(app: &tauri::AppHandle, text: &str) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::set_pasteboard(app, text)?;
+        // NSPasteboard is async with the paste server; Cmd+V too soon pastes
+        // the previous contents.
+        std::thread::sleep(std::time::Duration::from_millis(90));
+        return Ok(());
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+        use anyhow::Context;
+        use arboard::Clipboard;
+        let mut clipboard = Clipboard::new().context("open clipboard")?;
+        clipboard.set_text(text).context("set clipboard")?;
+        Ok(())
+    }
 }
 
 fn paste_at_caret(app: &tauri::AppHandle, text: &str) -> Result<InsertResult> {
+    crate::focus::stop_caret_watch();
+    set_clipboard(app, text)?;
+
+    // Stay hidden until the target app has handled Cmd+V. Bringing the
+    // overlay back immediately steals key-window status and the paste dies.
+    crate::overlay::hide_for_insert(app);
+    crate::focus::hide_our_windows(app);
     crate::focus::activate_captured(app);
 
     #[cfg(target_os = "macos")]
     {
-        if macos::insert_at_tracked_caret(text) {
+        if macos::insert_at_live_caret(text) {
             return Ok(InsertResult::Pasted);
+        }
+        crate::focus::activate_captured(app);
+        if let Some(caret) = crate::focus::captured_caret() {
+            crate::ax::prepare_insert(&caret);
         }
     }
 
-    // Keyboard paste needs the text on the pasteboard. Leave it there: if the
-    // synthetic Cmd+V is ignored, the user can still paste by hand.
-    set_clipboard(text)?;
+    #[cfg(not(target_os = "macos"))]
+    {
+        crate::focus::activate_captured(app);
+    }
     if let Err(e) = simulate_paste(crate::focus::captured_pid()) {
         log::warn!("paste simulation skipped: {e}");
+        #[cfg(target_os = "macos")]
+        if !crate::ax::api_available() {
+            notify_accessibility_needed(app);
+        }
         return Ok(InsertResult::Copied);
     }
+    // Let the frontmost app consume Cmd+V before anything of ours reappears.
+    std::thread::sleep(std::time::Duration::from_millis(220));
     Ok(InsertResult::Pasted)
+}
+
+#[cfg(target_os = "macos")]
+fn notify_accessibility_needed(app: &tauri::AppHandle) {
+    use tauri::Emitter;
+    log::warn!("accessibility not trusted; transcript copied to clipboard only");
+    let _ = app.emit(
+        "permission-needed",
+        crate::pipeline::PermissionNeededPayload {
+            kind: "accessibility",
+            message: "Text was copied to the clipboard. Enable Accessibility for Fuk \
+                      (System Settings → Privacy & Security → Accessibility) so it can \
+                      type at the cursor. After reinstalling a build, toggle Fuk off \
+                      and on again there."
+                .to_string(),
+        },
+    );
+    crate::tray::show_settings_on_main(app);
 }
 
 fn simulate_paste(target_pid: Option<i32>) -> Result<()> {
@@ -100,33 +149,58 @@ mod macos {
 
     const KEY_V: u16 = 0x09;
 
-    pub fn insert_at_tracked_caret(text: &str) -> bool {
-        if let Some(field) = crate::focus::captured_field() {
-            match crate::ax::insert_at_caret(&field, text) {
+    pub fn insert_at_live_caret(text: &str) -> bool {
+        // Prefer the field we tracked while the user was actually typing —
+        // after the overlay appears, the live system focus is often Fuk or a
+        // non-editable web view.
+        if let Some(caret) = crate::focus::captured_caret() {
+            match crate::ax::insert_caret(&caret, text) {
                 Ok(()) => {
-                    log::info!("inserted at the captured caret");
+                    log::info!(
+                        "inserted at tracked caret pid {} range {}+{}",
+                        caret.pid,
+                        caret.location,
+                        caret.length
+                    );
                     return true;
                 }
-                Err(e) => log::debug!("captured caret insert: {e}"),
+                Err(e) => log::info!("tracked caret AX insert: {e}"),
             }
         }
         if let Some(pid) = crate::focus::captured_pid() {
             match crate::ax::insert_into_app(pid, text) {
                 Ok(()) => {
-                    log::info!("inserted at pid {pid} focused field");
+                    log::info!("inserted at live caret in pid {pid}");
                     return true;
                 }
-                Err(e) => log::debug!("focused field insert: {e}"),
+                Err(e) => log::info!("live focused-field insert: {e}"),
+            }
+        }
+        if let Some(caret) = crate::ax::system_caret() {
+            if caret.pid != std::process::id() as i32 {
+                match crate::ax::insert_caret(&caret, text) {
+                    Ok(()) => {
+                        log::info!(
+                            "inserted at system caret pid {} range {}+{}",
+                            caret.pid,
+                            caret.location,
+                            caret.length
+                        );
+                        return true;
+                    }
+                    Err(e) => log::info!("system caret insert: {e}"),
+                }
             }
         }
         false
     }
 
-    pub fn cmd_v(target_pid: Option<i32>) -> Result<()> {
+    pub fn cmd_v(_target_pid: Option<i32>) -> Result<()> {
+        // Always HID into the frontmost app. post_to_pid is ignored by
+        // Electron/Chrome, which is most of the fields people dictate into.
         let source = event_source()?;
         let cmd = CGEventFlags::CGEventFlagCommand;
 
-        // A leftover push-to-talk modifier turns Cmd+V into a different shortcut.
         for extra in [
             KeyCode::CONTROL,
             KeyCode::SHIFT,
@@ -134,9 +208,9 @@ mod macos {
             KeyCode::COMMAND,
         ] {
             let up = key(source.clone(), extra, false, CGEventFlags::CGEventFlagNull)?;
-            post_opt(target_pid, &up);
+            up.post(CGEventTapLocation::HID);
         }
-        thread::sleep(Duration::from_millis(12));
+        thread::sleep(Duration::from_millis(20));
 
         let cmd_down = key(source.clone(), KeyCode::COMMAND, true, cmd)?;
         let v_down = key(source.clone(), KEY_V, true, cmd)?;
@@ -144,15 +218,18 @@ mod macos {
         let cmd_up = key(source, KeyCode::COMMAND, false, CGEventFlags::CGEventFlagNull)?;
 
         for event in [&cmd_down, &v_down, &v_up, &cmd_up] {
-            post_opt(target_pid, event);
-            thread::sleep(Duration::from_millis(8));
+            event.post(CGEventTapLocation::HID);
+            thread::sleep(Duration::from_millis(12));
         }
         Ok(())
     }
 
     fn event_source() -> Result<CGEventSource> {
-        CGEventSource::new(CGEventSourceStateID::HIDSystemState)
-            .or_else(|()| CGEventSource::new(CGEventSourceStateID::CombinedSessionState))
+        // CombinedSessionState is what Enigo uses for synthesized keypresses.
+        // HIDSystemState inherits leftover hardware modifiers (Control from
+        // push-to-talk) and the paste never looks like Cmd+V.
+        CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
+            .or_else(|()| CGEventSource::new(CGEventSourceStateID::HIDSystemState))
             .or_else(|()| CGEventSource::new(CGEventSourceStateID::Private))
             .map_err(|()| anyhow!("could not create a keyboard event source"))
     }
@@ -164,16 +241,25 @@ mod macos {
         Ok(event)
     }
 
-    fn post(pid: i32, event: &CGEvent) {
-        event.post_to_pid(pid);
-        event.post(CGEventTapLocation::HID);
-    }
+    pub fn set_pasteboard(app: &tauri::AppHandle, text: &str) -> Result<()> {
+        use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
+        use objc2_foundation::NSString;
 
-    fn post_opt(pid: Option<i32>, event: &CGEvent) {
-        if let Some(pid) = pid {
-            post(pid, event);
-        } else {
-            event.post(CGEventTapLocation::HID);
+        let text = text.to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _ = app.run_on_main_thread(move || {
+            let pb = NSPasteboard::generalPasteboard();
+            pb.clearContents();
+            let ok = pb.setString_forType(
+                &NSString::from_str(&text),
+                unsafe { NSPasteboardTypeString },
+            );
+            let _ = tx.send(ok);
+        });
+        match rx.recv_timeout(Duration::from_millis(400)) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(anyhow!("NSPasteboard rejected the transcript")),
+            Err(_) => Err(anyhow!("timed out writing the pasteboard")),
         }
     }
 }

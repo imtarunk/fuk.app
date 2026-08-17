@@ -69,14 +69,18 @@ export default {
           "0%": { opacity: "0" },
           "100%": { opacity: "1" },
         },
+        loader: {
+          to: { transform: "rotate(360deg)" },
+        },
       },
       animation: {
         wave: "wave 0.9s ease-in-out infinite",
         "caret-blink": "caret-blink 1s step-end infinite",
         breathe: "breathe 1.6s ease-in-out infinite",
-        pillIn: "pillIn 120ms ease both",
-        pillOut: "pillOut 120ms ease both",
-        popIn: "popIn 120ms ease both",
+        pillIn: "pillIn 140ms ease both",
+        pillOut: "pillOut 160ms ease both",
+        popIn: "popIn 140ms ease both",
+        loader: "loader 0.85s linear infinite",
       },
       transitionDuration: {
         press: "120ms",
