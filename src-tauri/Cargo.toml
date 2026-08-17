@@ -1,0 +1,60 @@
+[package]
+name = "dictate"
+version = "0.1.0"
+description = "Fuk — local push-to-talk voice-to-text for any app"
+authors = ["you"]
+edition = "2021"
+
+[lib]
+name = "dictate_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png", "macos-private-api"] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+dirs = "6"
+toml = "0.8"
+parking_lot = "0.12"
+once_cell = "1"
+cpal = "0.15"
+rdev = "0.5"
+arboard = "3"
+enigo = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs"] }
+futures-util = "0.3"
+num_cpus = "1"
+encoding_rs = "0.8"
+tauri-plugin-global-shortcut = "2"
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+whisper-rs = "0.16"
+llama-cpp-2 = "0.1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+whisper-rs = { version = "0.16", features = ["metal"] }
+llama-cpp-2 = { version = "0.1", features = ["metal"] }
+macos-accessibility-client = "0.0.1"
+core-foundation = "0.10"
+core-graphics = { version = "0.24", features = ["elcapitan"] }
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSProcessInfo", "NSString"] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSEvent",
+    "block2",
+    "NSWorkspace",
+    "NSRunningApplication",
+    "NSWindow",
+    "NSApplication",
+    "libc",
+] }
+block2 = "0.6"

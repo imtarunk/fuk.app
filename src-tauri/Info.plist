@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Fuk captures your microphone locally so it can transcribe speech on-device. Audio never leaves this computer.</string>
+  <key>NSAudioCaptureUsageDescription</key>
+  <string>Fuk needs audio capture to transcribe your speech locally. Nothing is uploaded.</string>
+  <key>LSUIElement</key>
+  <true/>
+  <key>NSSupportsAutomaticTermination</key>
+  <false/>
+  <key>NSSupportsSuddenTermination</key>
+  <false/>
+</dict>
+</plist>
